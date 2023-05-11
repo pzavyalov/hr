@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -14,91 +15,97 @@ import (
 // приложение эмулирует получение и обработку тасков, пытается и получать и обрабатывать в многопоточном режиме
 // В конце должно выводить успешные таски и ошибки выполнены остальных тасков
 
-// A Ttype represents a meaninglessness of our life
-type Ttype struct {
-	id         int
-	cT         string // время создания
-	fT         string // время выполнения
-	taskRESULT []byte
+
+// Комментарии:
+// количество воркеров можно настраивать
+// не стал добавлять таймер на предельное время работы воркера, так как он гарантированно завершиться при такой реализации
+// не понятно как собирать результаты, но учитывая что они выводятся после того как все отработает, оставил как есть
+// не понятно что должно быть в taskResult, оставил тоже то что и писалось, добавил признак успешности выполнения таска.
+// поменял генерацию id таска, так как при старой реализации они дублировались
+// если оставлять текущую логику, ошибочных тасков не генерируется, только если поменять условие
+
+var workersCtn = 10
+
+type Task struct {
+	ID        int64
+	CreatedAt time.Time     // время создания
+	Duration  time.Duration // время выполнения
+	Result    []byte
+	IsSuccess bool
 }
 
 func main() {
-	taskCreturer := func(a chan Ttype) {
+	var errs []error
+	result := map[int64]Task{}
+	mu := sync.Mutex{}
+	collectorCh := make(chan Task)
+	doneCh := make(chan struct{})
+
+	go taskCreator(collectorCh, doneCh)
+
+	wg := sync.WaitGroup{}
+	for i := 0; i < workersCtn; i++ { // запускаем пулл горутин на обработку тасков
+		wg.Add(1)
 		go func() {
-			for {
-				ft := time.Now().Format(time.RFC3339)
-				if time.Now().Nanosecond()%2 > 0 { // вот такое условие появления ошибочных тасков
-					ft = "Some error occured"
+			// получение тасков
+			for t := range collectorCh {
+				t := taskWorker(t)
+				if t.IsSuccess {
+					mu.Lock()
+					result[t.ID] = t
+					mu.Unlock()
+				} else {
+					errs = append(errs, fmt.Errorf("Task ID %d time %s, error %s", t.ID, t.CreatedAt, t.Result))
 				}
-				a <- Ttype{cT: ft, id: int(time.Now().Unix())} // передаем таск на выполнение
 			}
+			wg.Done()
 		}()
 	}
 
-	superChan := make(chan Ttype, 10)
-
-	go taskCreturer(superChan)
-
-	task_worker := func(a Ttype) Ttype {
-		tt, _ := time.Parse(time.RFC3339, a.cT)
-		if tt.After(time.Now().Add(-20 * time.Second)) {
-			a.taskRESULT = []byte("task has been successed")
-		} else {
-			a.taskRESULT = []byte("something went wrong")
-		}
-		a.fT = time.Now().Format(time.RFC3339Nano)
-
-		time.Sleep(time.Millisecond * 150)
-
-		return a
-	}
-
-	doneTasks := make(chan Ttype)
-	undoneTasks := make(chan error)
-
-	tasksorter := func(t Ttype) {
-		if string(t.taskRESULT[14:]) == "successed" {
-			doneTasks <- t
-		} else {
-			undoneTasks <- fmt.Errorf("Task id %d time %s, error %s", t.id, t.cT, t.taskRESULT)
-		}
-	}
-
-	go func() {
-		// получение тасков
-		for t := range superChan {
-			t = task_worker(t)
-			go tasksorter(t)
-		}
-		close(superChan)
-	}()
-
-	result := map[int]Ttype{}
-	err := []error{}
-	go func() {
-		for r := range doneTasks {
-			go func() {
-				result[r.id] = r
-			}()
-		}
-		for r := range undoneTasks {
-			go func() {
-				err = append(err, r)
-			}()
-		}
-		close(doneTasks)
-		close(undoneTasks)
-	}()
-
 	time.Sleep(time.Second * 3)
+	doneCh <- struct{}{} // закроет канал коллектор, го-рутины начнут выходить из цикла
+	wg.Wait() // дожидаемся когда все горутины доработают
 
 	println("Errors:")
-	for r := range err {
-		println(r)
+	for _, r := range errs {
+		println(r.Error())
 	}
 
 	println("Done tasks:")
 	for r := range result {
 		println(r)
 	}
+}
+
+func taskCreator(collectorCh chan Task, doneCh chan struct{}) {
+	for {
+		select {
+		case <- doneCh:
+			close(collectorCh)
+			return
+		default:
+			createdAt := time.Now()
+			if createdAt.Nanosecond()%2 > 0 { // вот такое условие появления ошибочных тасков
+				createdAt = time.Now().Add(-30 * time.Second)
+			}
+			collectorCh <- Task{CreatedAt: createdAt, ID: time.Now().UnixMicro()} // передаем таск на выполнение
+		}
+	}
+}
+
+func taskWorker(task Task) Task {
+	startedAt := time.Now()
+
+	if task.CreatedAt.After(time.Now().Add(-20 * time.Second)) {
+		task.Result = []byte("task has been successed")
+		task.IsSuccess = true
+	} else {
+		task.Result = []byte("something went wrong")
+	}
+
+	task.Duration = time.Now().Sub(startedAt)
+
+	time.Sleep(time.Millisecond * 150)
+
+	return task
 }
